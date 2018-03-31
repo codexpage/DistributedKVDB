@@ -10,8 +10,12 @@ import (
 	// "time"
 	// "flag"
 	"bytes"
+	"crypto/md5"
+	"encoding/binary"
 	"io/ioutil"
 	"os"
+	"os/signal"
+	"syscall"
 )
 
 type Kv struct {
@@ -27,6 +31,11 @@ type KvArray struct {
 //use a map to store data
 var Data = make(map[string]string)
 
+var proxyip = "http://localhost:8080"
+var selfip string //selfip
+
+var sigs = make(chan os.Signal, 1)
+
 func tojson(data []Kv) []byte {
 	var jsonData []byte
 	// kvs_amount := 0
@@ -41,6 +50,14 @@ func tojson(data []Kv) []byte {
 	}
 	return jsonData
 
+}
+
+//return a int hash value
+func md5hash(str string) int {
+	hash := md5.Sum([]byte(str))
+	//res := hex.EncodeToString(hash[:])
+	res := binary.BigEndian.Uint32(hash[1:5]) //0-7Byte 64bit
+	return int(res)
 }
 
 func sendRequest(host string, jsonData []byte, request_type string, endpoint string) string {
@@ -95,6 +112,7 @@ func fetchHandler(w http.ResponseWriter, r *http.Request, request_method string)
 			allrespData = append(allrespData, Kv{k, v})
 		}
 	}
+	fmt.Println(string(tojson(allrespData)))
 	fmt.Fprint(w, string(tojson(allrespData)))
 }
 
@@ -151,6 +169,34 @@ func deleteHandler(w http.ResponseWriter, r *http.Request, request_method string
 
 }
 
+func moveDataHandler(w http.ResponseWriter, r *http.Request, request_method string) {
+	var data KvArray
+	err := json.NewDecoder(r.Body).Decode(&data)
+	if err != nil {
+		fmt.Println("error")
+		panic(err)
+	}
+	kv := data.KvPair[0]
+	ip := kv.Value //get ip to move
+	h := md5hash(ip)
+	var dataToMove []Kv
+	for k, v := range Data {
+		itemh := md5hash(k)
+		if itemh <= h || (itemh > h && itemh > md5hash(selfip)) { //two situation
+			dataToMove = append(dataToMove, Kv{k, v})
+		}
+	}
+	jsonData := tojson(dataToMove)
+	sendRequest(ip, jsonData, request_method, "/set") //send data
+	//detele moved data after moved
+	movednum := len(dataToMove)
+	for _, kv := range dataToMove {
+		delete(Data, kv.Key)
+	}
+	fmt.Fprint(w, movednum)
+
+}
+
 func get(w http.ResponseWriter, r *http.Request) {
 	fmt.Println("get...")
 	if r.Method == "POST" { //get specific data
@@ -180,11 +226,43 @@ func deleteEntry(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func add_to_proxy(port string) {
-	sendRequest("http://localhost:8080", tojson([]Kv{Kv{Key: "1", Value: "http://localhost:" + port}}), "POST", "/newnode")
+func moveData(w http.ResponseWriter, r *http.Request) {
+	fmt.Println("moveData...")
+	if r.Method == "POST" { //get specific data
+		moveDataHandler(w, r, "POST")
+	} else {
+		fmt.Fprint(w, "Wrong url") //should be json!!
+	}
+}
+
+func add_to_proxy(ip string) {
+	sendRequest(proxyip, tojson([]Kv{Kv{Key: "1", Value: ip}}), "POST", "/newnode")
+}
+
+func transferAllData() {
+	//send selfip to proxy
+	nextip := sendRequest(proxyip, tojson([]Kv{Kv{Key: "1", Value: selfip}}), "POST", "/deletenode")
+	var dataToMove []Kv
+	for k, v := range Data {
+		dataToMove = append(dataToMove, Kv{k, v})
+	}
+	jsonData := tojson(dataToMove)
+	//send all data set to the next ip
+	sendRequest(nextip, jsonData, "POST", "/set") //send all data
+}
+
+func exitHandler() {
+	sig := <-sigs
+	fmt.Println()
+	fmt.Println(sig)
+	transferAllData()
+	fmt.Println("Exiting..")
+	os.Exit(0)
 }
 
 func runserver(port string) {
+	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+	go exitHandler()
 	// http.HandleFunc("/", rootHandler) //register the handler
 	// log.Fatal(http.ListenAndServe(":8080", nil))
 	router := mux.NewRouter().StrictSlash(true)
@@ -192,6 +270,7 @@ func runserver(port string) {
 	router.HandleFunc("/get", get)
 	router.HandleFunc("/set", set)
 	router.HandleFunc("/delete", deleteEntry)
+	router.HandleFunc("/movedata", moveData)
 	fmt.Printf("Server Listen at localhost: %s\n", port)
 	log.Fatal(http.ListenAndServe(":"+port, router))
 }
@@ -202,7 +281,8 @@ func main() {
 		return
 	}
 	port := os.Args[1]
-	add_to_proxy(port)
+	selfip = "http://localhost:" + port
+	add_to_proxy(selfip)
 	runserver(port)
 	// port := flag.String("port", "8000", "Server Port")
 }
